@@ -14,7 +14,7 @@ impl MnistClassifier {
 
     pub fn forward(&self, input: &Tensor) -> Result<Tensor, TensorError> {
         let logits = self.linear.forward(input)?;
-        Softmax::forward(&logits)
+        Softmax::forward(&logits, None)
     }
 
     pub fn predict(&self, input: &Tensor) -> Result<Vec<usize>, TensorError> {

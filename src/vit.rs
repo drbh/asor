@@ -3,7 +3,7 @@ use crate::{LayerNorm, LinearLayer, TransformerBlock};
 
 #[derive(Clone)]
 pub struct VisionTransformer {
-    patch_embed: LinearLayer,
+    patch_embeds: Vec<LinearLayer>,
     pos_embed: Tensor,
     transformer_blocks: Vec<TransformerBlock>,
     norm: LayerNorm,
@@ -11,6 +11,7 @@ pub struct VisionTransformer {
     patch_size: usize,
     image_size: usize,
     in_channels: usize,
+    cls_token: Tensor,
 }
 
 impl VisionTransformer {
@@ -26,13 +27,15 @@ impl VisionTransformer {
         let num_patches = (image_size / patch_size) * (image_size / patch_size);
         let patch_dim = in_channels * patch_size * patch_size;
 
-        let pos_embed = Tensor::zeros(vec![1, num_patches + 1, hidden_size]);
+        let pos_embed = Tensor::ones(vec![1, num_patches + 1, hidden_size]);
         let transformer_blocks = (0..num_layers)
             .map(|_| TransformerBlock::new(hidden_size, num_heads))
             .collect::<Vec<_>>();
 
+        let cls_token = Tensor::ones(vec![1, 1, hidden_size]);
+
         Self {
-            patch_embed: LinearLayer::new(patch_dim, hidden_size),
+            patch_embeds: vec![LinearLayer::new(patch_dim, hidden_size); num_patches],
             pos_embed,
             transformer_blocks,
             norm: LayerNorm::new(hidden_size),
@@ -40,6 +43,7 @@ impl VisionTransformer {
             patch_size,
             image_size,
             in_channels,
+            cls_token,
         }
     }
 
@@ -56,65 +60,49 @@ impl VisionTransformer {
         let n_patches = n_h * n_w;
         let patch_dim = self.in_channels * self.patch_size * self.patch_size;
 
-        let mut patches = vec![0.0; batch_size * n_patches * patch_dim];
+        let mut patches: Vec<Vec<f32>> = vec![];
         for b in 0..batch_size {
-            for h in 0..n_h {
-                for w in 0..n_w {
-                    let patch_idx = h * n_w + w;
-                    for c in 0..self.in_channels {
-                        for ph in 0..self.patch_size {
-                            for pw in 0..self.patch_size {
-                                let img_h = h * self.patch_size + ph;
-                                let img_w = w * self.patch_size + pw;
-                                let img_idx = ((b * self.in_channels + c) * self.image_size
-                                    + img_h)
-                                    * self.image_size
-                                    + img_w;
-                                let patch_offset = (b * n_patches + patch_idx) * patch_dim
-                                    + (c * self.patch_size * self.patch_size
-                                        + ph * self.patch_size
-                                        + pw);
-                                patches[patch_offset] = x.data[img_idx];
-                            }
-                        }
-                    }
+            for i in 0..n_h {
+                for j in 0..n_w {
+                    let patch = x.data[b * n_h * n_w * patch_dim
+                        + i * n_w * patch_dim
+                        + j * patch_dim
+                        ..b * n_h * n_w * patch_dim + i * n_w * patch_dim + (j + 1) * patch_dim]
+                        .to_vec();
+
+                    let patch = patch.clone();
+                    patches.push(patch);
                 }
             }
         }
-        Tensor::new(patches, vec![batch_size, n_patches, patch_dim])
+        let patches = Tensor::new(
+            patches.into_iter().flatten().collect(),
+            vec![batch_size, n_patches, patch_dim],
+        )?;
+        Ok(patches)
     }
 
     pub fn forward(&self, x: &Tensor) -> Result<Tensor, TensorError> {
-        // extract and embed patches
         let patches = self.extract_patches(x)?;
-        let batch_size = patches.shape[0];
+        let _batch_size = patches.shape[0];
         let n_patches = patches.shape[1];
-
-        let mut embedded_patches =
-            Vec::with_capacity(batch_size * n_patches * self.pos_embed.shape[2]);
+        let mut embedded_patches = Vec::<Tensor>::with_capacity(n_patches);
         for i in 0..n_patches {
             let start = i * patches.shape[2];
             let end = (i + 1) * patches.shape[2];
             let patch_tensor =
                 Tensor::new(patches.data[start..end].to_vec(), vec![1, patches.shape[2]])?;
-
-            let patch_embed = self.patch_embed.forward(&patch_tensor)?;
-            let _embedded_patches = patch_embed.add(&self.pos_embed)?;
-            embedded_patches.extend_from_slice(&_embedded_patches.data);
+            let _embedded_patches = patch_tensor.matmul(&self.patch_embeds[i].weights)?;
+            let _embedded_patches = _embedded_patches.add(&self.patch_embeds[i].bias)?;
+            embedded_patches.push(_embedded_patches);
         }
 
-        // reshape to [batch_size, n_patches, hidden_dim]
-        let hidden_dim = self.pos_embed.shape[2];
+        let embedded =
+            Tensor::concat(&embedded_patches.iter().collect::<Vec<_>>(), 0)?.unsqueeze(0)?;
 
-        let embedded = Tensor::new(
-            vec![1.0; hidden_dim]
-                .into_iter()
-                .chain(embedded_patches.into_iter())
-                .collect(),
-            vec![batch_size, n_patches + 1, hidden_dim],
-        )?;
+        let embedded = Tensor::concat(&[&self.cls_token, &embedded], 1)?;
 
-        // position embeddings
+        let _hidden_dim = self.pos_embed.shape[2];
         let tokens = embedded.add(&self.pos_embed)?;
 
         let mut x = tokens;
@@ -123,22 +111,7 @@ impl VisionTransformer {
         }
 
         let x = self.norm.forward(&x)?;
-
-        let batch_features: Vec<f32> = (0..batch_size)
-            .flat_map(|b| {
-                let start = b * n_patches * hidden_dim;
-                let mut avg = vec![0.0; hidden_dim];
-                for p in 0..n_patches {
-                    for (h, item) in avg.iter_mut().enumerate().take(hidden_dim) {
-                        *item += x.data[start + p * hidden_dim + h] / (n_patches as f32);
-                    }
-                }
-                avg
-            })
-            .collect();
-
-        // final classification
-        self.head
-            .forward(&Tensor::new(batch_features, vec![batch_size, hidden_dim])?)
+        let x = self.head.forward(&x)?;
+        Ok(x)
     }
 }
